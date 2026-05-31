@@ -1,0 +1,47 @@
+services:
+  redis:
+    image: redis:latest
+    container_name: gateway-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - gateway-network
+
+  gateway:
+    build: .
+    container_name: api-gateway
+    ports:
+      - "8080:8080"
+    environment:
+      - spring.data.redis.host=redis
+      - spring.data.redis.port=6379
+    depends_on:
+      - redis
+    networks:
+      - gateway-network
+
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    depends_on:
+      - gateway
+    networks:
+      - gateway-network
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - gateway-network
+
+networks:
+  gateway-network:
+    driver: bridge
