@@ -7,6 +7,7 @@ import com.example.Gateway.gateway.ProxyRoute;
 import com.example.Gateway.gateway.RouteConfig;
 import com.example.Gateway.logger.GatewayLogger;
 import com.example.Gateway.model.ApiKey;
+import com.example.Gateway.model.RateLimitInfo;
 import com.example.Gateway.model.RequestContext;
 import com.example.Gateway.model.RoutePolicy;
 import com.example.Gateway.resilience.LocalRateLimiter;
@@ -57,30 +58,33 @@ public class GatewayInterceptor implements HandlerInterceptor {
                              HttpServletResponse response,
                              Object handler) throws Exception {
 
-        String requestId = UUID.randomUUID().toString().substring(0,8);
+        String requestId = UUID.randomUUID().toString().substring(0, 8);
         RequestContext ctx = new RequestContext(requestId);
         response.setHeader("X-Request-ID", requestId);
 
-        String apiKey = request.getHeader("X-API-KEY");
+        // Admin Bypass
+        String requestUri = request.getRequestURI();
+        if (requestUri.startsWith("/admin/")) {
+            return true;
+        }
 
-        //Step 1 - auth
-        if(apiKey == null){
+        // Step 1 - Auth
+        String apiKey = request.getHeader("X-API-KEY");
+        if (apiKey == null) {
             response.setStatus(401);
             response.getWriter().write("Invalid API-KEY");
             return false;
         }
 
         ApiKey validatedKey = apiKeyValidator.validate(apiKey);
-        if(validatedKey == null){
-            meterRegistry.counter("gateway.auth.failures",
-                    "reason", "invalid_key"
-            ).increment();
+        if (validatedKey == null) {
+            meterRegistry.counter("gateway.auth.failures", "reason", "invalid_key").increment();
             response.setStatus(401);
             response.getWriter().write("Invalid API-KEY");
             return false;
         }
 
-        //Step 2 - Build Context
+        // Step 2 - Build context
         String identity = validatedKey.getOwner();
         String tier = validatedKey.getTier();
         String route = request.getRequestURI();
@@ -92,48 +96,54 @@ public class GatewayInterceptor implements HandlerInterceptor {
         RoutePolicy policy = routeConfig.getPolicyForRoute(route, tier);
         ctx.setAlgorithm(policy.getAlgorithm());
 
-        //Step 3 - Rate Limit
-        meterRegistry.counter("gateway.requests.total",
-                "route", route,
-                "tier", tier
-        ).increment();
+        meterRegistry.counter("gateway.requests.total", "route", route, "tier", tier).increment();
 
+        // Step 3 - Rate limit
+        // RateLimitInfo carries limit/remaining/reset so ProxyHandler can write
+        // X-RateLimit-* headers on every response, and Retry-After on 429s.
+        boolean allowed;
+        RateLimitInfo rateLimitInfo;
 
-        boolean allowed = false;
-
-
-        if(redisHealthMonitor.isHealthy()){
-            // normal path - Redis Based Limiting
+        if (redisHealthMonitor.isHealthy()) {
             RateLimiterAlgo algo = algorithms.get(policy.getAlgorithm());
             allowed = algo.isAllowed(identity, route, policy, request, response);
             ctx.setAllowed(allowed);
-        } else {
-            log.warn("[{}] Redis unavailable - using local fallback limiter",
-                    requestId);
-            allowed = localRateLimiter.isAllowed(identity, route);
-            if(!allowed) response.setStatus(429);
 
-            // track fallback usage in metrics
-            meterRegistry.counter("gateway.redis.fallback",
-                    "route", route).increment();
+            // Most algorithms track remaining internally via Redis.
+            // We use policy.getMaxRequests() as the cap; remaining is approximate
+            // here — a future improvement would be to have isAllowed() return it directly.
+            rateLimitInfo = RateLimitInfo.fromPolicy(policy, allowed ? policy.getMaxRequests() - 1 : 0);
+        } else {
+            log.warn("[{}] Redis unavailable - using local fallback limiter", requestId);
+            allowed = localRateLimiter.isAllowed(identity, route);
+            if (!allowed) response.setStatus(429);
+            meterRegistry.counter("gateway.redis.fallback", "route", route).increment();
+
+            // On the fallback limiter we don't have precise remaining counts,
+            // so we signal unknown with remaining = -1. ProxyHandler skips
+            // X-RateLimit-Remaining in that case rather than lying to the client.
+            rateLimitInfo = RateLimitInfo.unknown(policy);
         }
 
-        if(!allowed) {
+        if (!allowed) {
             ctx.setStatusCode(429);
-            meterRegistry.counter("gateway.requests.blocked",
-                    "route", route,
-                    "tier", tier
-            ).increment();
+            meterRegistry.counter("gateway.requests.blocked", "route", route, "tier", tier).increment();
+
+            // Write rate limit headers even on blocked responses —
+            // Retry-After especially is critical so clients back off correctly.
+            response.setHeader("X-RateLimit-Limit", String.valueOf(policy.getMaxRequests()));
+            response.setHeader("Retry-After", String.valueOf(rateLimitInfo.getRetryAfterSeconds()));
+
             gatewayLogger.logRequest(ctx);
             return false;
         }
 
-        //Step 4 - Proxy
+        // Step 4 - Proxy
         ProxyRoute proxyRoute = routeConfig.getProxyRoute(route);
-        if(proxyRoute != null){
+        if (proxyRoute != null) {
             ctx.setStatusCode(200);
             gatewayLogger.logRequest(ctx);
-            return proxyHandler.forward(proxyRoute.getTargetUrl(), request, response);
+            return proxyHandler.forward(proxyRoute, route, requestId, tier, rateLimitInfo, request, response);
         }
 
         ctx.setStatusCode(200);

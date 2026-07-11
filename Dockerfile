@@ -14,4 +14,4 @@ RUN ./mvnw package -DskipTests
 
 EXPOSE 8080
 
-CMD java -jar target/*.jar
+ENTRYPOINT ["java", "-jar", "target/ApiGateway-0.0.1-SNAPSHOT.jar"]
